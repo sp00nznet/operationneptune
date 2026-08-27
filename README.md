@@ -24,7 +24,24 @@ Bolo Adventures III (1993) and El-Fish (1993).
 **Phase 1 — lifted.** Recon is done and the whole binary is through the lifter.
 Nothing runs yet.
 
-LIFT_PLACEHOLDER
+| | |
+|---|---:|
+| Functions recovered | 1,205 (143 thunks) |
+| Instructions decoded | 91,587 |
+| Code bytes covered | 175,839 of 176,128 — **99.84%** |
+| Lines of generated C | 189,190 |
+| Lift errors | 0 |
+| Unsupported opcodes | 0 |
+| Import stubs generated | 139 |
+
+Zero errors and zero dropped opcodes is not the usual first-pass result. It is
+what a small, unpacked, Borland-compiled 32-bit binary with no hand-written
+assembly and no DirectX looks like going through `lift32` — plain integer code,
+x87 for the maths, and `BitBlt` for the pixels.
+
+It does not build yet: the generated code needs `recomp_types.h` and the runtime
+wired up, and the 139 imports are stubs that abort. That is the next commit, not
+this one.
 
 Assets are already solved. `tools/extract_assets.py`, carried over from the
 earlier OpenGizmos clean-room work on this engine family, pulls the game apart
@@ -104,8 +121,11 @@ python tools/extract_assets.py on original extracted/on --all
    transfer to the PE. Matching the two builds — by module size, call-graph
    shape and string references — turns 1,058 names into 1,058 named lifted
    functions. This is the highest-value thing left.
-2. **Bridge the imports.** 139 stubs across GDI32, USER32, KERNEL32 and WINMM.
-   pcrecomp's `runtime/compat` already maps most of this onto SDL2.
+2. **Bridge the imports.** 139 of them across GDI32, USER32, KERNEL32 and
+   WINMM. pcrecomp's `runtime/compat/win32_compat.h` already answers 65; the
+   remaining 74 are GDI palettes and DCs, menus and dialogs, the `FindResource`
+   /`LoadResource`/`LockResource` trio, the `_lopen`/`_lread` file family, and
+   `waveOut*`. No DirectX, which is the whole reason this is tractable.
 3. **Boot it.** Entry point, CRT startup, first frame.
 
 ## Legal

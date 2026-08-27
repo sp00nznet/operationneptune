@@ -32,6 +32,7 @@ work/
 
 # Generated recompiled code
 src/recomp/gen/
+src/recomp/imports_stub.c
 
 # Extracted assets (regenerate from your own copy)
 extracted/
