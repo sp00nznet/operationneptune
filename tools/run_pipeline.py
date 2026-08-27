@@ -98,6 +98,9 @@ def generate_recomp_files(functions, iat_map, output_dir, split_size=1000, func_
     for stale in _glob.glob(os.path.join(output_dir, 'recomp_[0-9]*.c')):
         os.remove(stale)
 
+    for addr, nm in (func_names or {}).items():
+        if addr in functions:
+            functions[addr].name = nm
     lifter = Lifter(iat_map=iat_map, func_names=func_names or {},
                     lifted=set(functions.keys()),
                     # cmp/sbb/neg is how MGL returns success; the stale-_cf
@@ -134,9 +137,9 @@ def generate_recomp_files(functions, iat_map, output_dir, split_size=1000, func_
                     f.write('\n\n')
                     all_func_names.append((func.address, func.name))
                 except Exception as e:
-                    f.write(f"/* ERROR lifting sub_{func.address:08X}: {e} */\n")
-                    f.write(f"void sub_{func.address:08X}(void) {{ /* FAILED */ }}\n\n")
-                    all_func_names.append((func.address, f"sub_{func.address:08X}"))
+                    f.write(f"/* ERROR lifting {func.name}: {e} */\n")
+                    f.write(f"void {func.name}(void) {{ /* FAILED */ }}\n\n")
+                    all_func_names.append((func.address, func.name))
 
         func_idx += len(chunk)
         file_idx += 1
@@ -191,6 +194,9 @@ def main():
                         help='Generate import stub file')
     parser.add_argument('--pe-json', default=None,
                         help='Export PE analysis to JSON')
+    parser.add_argument('--names', default=None,
+                        help='JSON of VA -> {name, module} from tools/name_functions.py; '
+                             'lifted functions get these names instead of sub_XXXXXXXX')
 
     args = parser.parse_args()
 
@@ -227,9 +233,21 @@ def main():
     if args.all:
         # Step 3: Code generation
         print(f"\n[*] Phase 3: Code generation...")
+        func_names = {}
+        if args.names:
+            with open(args.names) as f:
+                for va, v in json.load(f).items():
+                    name = v['name'] if isinstance(v, dict) else v
+                    mod = v.get('module') if isinstance(v, dict) else None
+                    # Keep the address in the symbol: two modules can hold a
+                    # function of the same name, and a name that collides is
+                    # worse than one that is merely ugly.
+                    func_names[int(va, 16)] = f"{mod}_{name}" if mod else name
+            print(f"[*] {len(func_names)} functions will be named from {args.names}")
+
         all_funcs = generate_recomp_files(
             functions, iat_map, args.output,
-            split_size=args.split,
+            split_size=args.split, func_names=func_names,
         )
 
         elapsed = time.time() - start_time

@@ -68,8 +68,10 @@ Not working yet:
 - **Dialogs are stubbed.** `DialogBoxParamA` takes a dialog procedure that lives
   in lifted code; the window procedure already makes that round trip, so this is
   the same trick again. Nothing on the path above has needed one.
-- **Nothing is named.** 1,205 functions are still `sub_0041xxxx` while
-  `ONWIN.MAP` sits there with 1,058 names in it. See [Next](#next).
+- **Almost nothing is named.** Eight functions carry their real names; the other
+  1,197 are still `sub_0041xxxx` while `ONWIN.MAP` sits there with 760 in it.
+  See [NAMING](docs/NAMING.md) for how far the automatic matching gets and
+  exactly where it stops.
 - **No mission has been finished.** The sub moves and the reef is there; the
   maths problems, the foes and the capsule pieces are all still unvisited.
 
@@ -167,7 +169,9 @@ Two builds of the same source ship side by side — `ONWIN.EXE` (NE, 16-bit) and
 `ONWIN32.EXE` (PE32). `INSTALL\AUTORUN.INI` names `Onwin32.exe` as the product,
 so that is the recomp target. Nothing is packed or copy-protected.
 
-See [RECON](docs/RECON.md) for the full teardown.
+See [RECON](docs/RECON.md) for the full teardown, [SYMBOLS](docs/SYMBOLS.md)
+for what the linker map names, and [NAMING](docs/NAMING.md) for the attempt to
+carry those names into the 32-bit build.
 
 ## Layout
 
@@ -177,6 +181,8 @@ docs/           RECON, SYMBOLS, FORMATS
 tools/
   run_pipeline.py    PE analysis -> discovery -> lift -> C
   parse_map.py       ONWIN.MAP -> work/symbols.json
+  fingerprint.py     both builds' call graphs and API calls
+  name_functions.py  matches the two builds -> work/names.json
   extract_assets.py  TLC resource extractor (from OpenGizmos)
 src/engine/     the runtime: register model, low heap, IAT bridges, WinG
   audio.c            waveOut and MCI, translated for 64-bit
@@ -242,11 +248,13 @@ python tools/extract_assets.py on original extracted/on --all
 
 ## Next
 
-1. **Name the functions.** The map's addresses are 16-bit `seg:off` and do not
-   transfer to the PE. Matching the two builds — by module size, call-graph
-   shape and string references — turns 1,058 names into 1,058 named lifted
-   functions. This is the highest-value thing left; every trace above would read
-   in the game's own vocabulary instead of hex.
+1. **Name the functions.** Eight so far, derived rather than assumed, and the
+   matcher deadlocks there: it learns Win16 ordinals from matched functions and
+   matches functions using known ordinals, and six ordinals is not enough to
+   start the third round. A published Win16 ordinal table breaks it open in one
+   step — see [NAMING](docs/NAMING.md), which also records why position-based
+   matching cannot work here. Still the highest-value thing left: every trace
+   above would read in the game's own vocabulary instead of hex.
 2. **Play a mission through.** The sub moves and the reef is drawn; the maths
    problems, the foes, the capsule pieces and the salvage are all still
    unvisited.
