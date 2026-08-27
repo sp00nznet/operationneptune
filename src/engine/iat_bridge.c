@@ -46,7 +46,6 @@ void bridge_waveOutPrepareHeader(void);
 void bridge_waveOutUnprepareHeader(void);
 void bridge_waveOutWrite(void);
 void bridge_mciSendCommandA(void);
-void wave_sync_headers(void);
 u32  wave_lparam_to_game(uintptr_t lparam);
 
 /*
@@ -1092,7 +1091,6 @@ static void msg_from_game(u32 p, MSG *m) {
 
 static void bridge_PeekMessageA(void) {
     MSG m;
-    wave_sync_headers();
     eax = PeekMessageA(&m, (HWND)(uintptr_t)ARG(2), ARG(3), ARG(4), ARG(5));
     if (eax) msg_to_game(&m, ARG(1));
     esp += 4 + 20;

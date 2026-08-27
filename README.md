@@ -22,39 +22,45 @@ Bolo Adventures III (1993) and El-Fish (1993).
 
 **It plays.** The recompiled binary runs the Borland CRT startup, reaches
 WinMain, passes the game's own environment checks, opens all six of its resource
-DLLs by hand, plays the whole opening sequence with music and speech, signs a
-player in, and puts you in the submarine.
+DLLs by hand, plays the opening with its music and narration, signs a player in,
+and puts you in the submarine.
 
 ![In the submarine, Dragon Reef](docs/img/gameplay.png)
 
-*Sector First, Dragon Reef. The sub, the reef, the fish and the oxygen gauge —
-all drawn by Operation Neptune's own code, running natively. The arrow keys move
+*Sector First, Dragon Reef. The sub, the reef, the fish and the oxygen gauge,
+all drawn by Operation Neptune's own code running natively. The arrow keys move
 the sub.*
 
-![Sign in and choose a level](docs/img/signin.png)
+## What it looks like
 
-*The sign-in roster and the level chooser. The panel text is real GDI —
-`CreateFontIndirectA` and `TextOutA` into the same pixels the game writes its
-sprites to.*
+Every one of these is the recompiled game running.
 
-![The title screen](docs/img/title.png)
-![The opening dissolve](docs/img/dissolve.png)
+| | |
+|---|---|
+| ![The title screen](docs/img/title.png) | ![Mission control](docs/img/tracking.png) |
+| The title screen, with its Start and Intro buttons | Mission control, typed out a letter at a time |
+| ![The briefing](docs/img/briefing.png) | ![The opening dissolve](docs/img/dissolve.png) |
+| The briefing: the Galaxy space capsule | Mid-dissolve, the world map wiping through the sea |
+| ![Sign in](docs/img/signin.png) | ![Dragon Reef](docs/img/reef.png) |
+| Sign in, and choose a level | Launched, at the mouth of Dragon Reef |
 
-*The title screen, and mid-dissolve in the opening as the world map wipes
-through the sea. `OPENING` and its `_Odissolve` are two of the 96 modules the
-linker map names.*
+The panel text in the sign-in shots is real GDI — `CreateFontIndirectA` and
+`TextOutA` — drawn into the same pixels the game writes its sprites to. The
+title and the reef are its own sprite code. Both go through the WinG shim.
+
+## Where it works and where it doesn't
 
 Working:
 
-- **The intro runs** end to end — the title, the Galaxy capsule story screens,
-  the tracking map — with its MIDI score and its narration.
-- **Sound.** `Enept1.mid` plays through MCI; speech and effects go out through
-  `waveOut` at 8 and 16 kHz.
+- **The intro runs** end to end — the title, the mission-control track, the
+  Galaxy capsule briefing — with its MIDI score and its narration.
+- **Sound.** `Enept1.mid` and `Enept2.mid` play through MCI; speech and effects
+  go out through `waveOut` at 8, 16 and 22 kHz.
 - **Input.** Mouse and keyboard reach the game's own window procedure, so the
-  menus click and the sub moves.
+  menus click, names type, and the sub moves.
 - **The player roster.** New player, name entry, level choice, and the game
   starts in the right zone at the right difficulty.
-- **Graphics are correct**, sprites and GDI text alike, at 640x400 in 256
+- **Graphics are correct**, sprites and GDI text alike, at 640×400 in 256
   colours.
 
 Not working yet:
@@ -64,8 +70,8 @@ Not working yet:
   the same trick again. Nothing on the path above has needed one.
 - **Nothing is named.** 1,205 functions are still `sub_0041xxxx` while
   `ONWIN.MAP` sits there with 1,058 names in it. See [Next](#next).
-- **Nobody has finished a mission.** The sub moves and the reef is there; how
-  much of the puzzle machinery works is untested.
+- **No mission has been finished.** The sub moves and the reef is there; the
+  maths problems, the foes and the capsule pieces are all still unvisited.
 
 The lift itself:
 
@@ -114,8 +120,10 @@ Four other things could not simply be passed through to the host:
 - **Audio, twice over.** `WAVEHDR` is 32 bytes in the game and 48 here, and
   every MCI parameter block leads with a callback that grew from 4 bytes to 8.
   Each is copied field by field into a host-side twin in `src/engine/audio.c`.
-  The driver writes back, too — `WHDR_DONE` lands on the host's header while the
-  game polls its own, so the buffers are re-synced on every message pump.
+  The driver writes back, too, and the loop that plays the narration spins on
+  `WHDR_DONE` without ever pumping its message queue — so the device is opened
+  with our own callback whatever the game asked for, and that writes the flags
+  straight into the game's header.
 - **Two checks from 1996.** `CheckSound` opens `C:\WINDOWS\SYSTEM\MIDIMAP.CFG`,
   the Windows 3.1 MIDI mapper config; `CheckDisplay` wants the desktop in
   640×480 at 256 colours. Both are the game's own INI switches, meant to be
@@ -211,11 +219,16 @@ the client area, and the picture is blitted to client (0,0), so a pixel in a
 screenshot is a coordinate you can click:
 
 ```powershell
-# sign in as ALEX, pick the Voyager game, and take the sub for a swim
-scripts\shot.ps1 -At 300,360 -Out work\play.png `
-    -Clicks 30,45,60,75,90,110,140,"160@262,290","205@136,290","240@300,229" `
-    -Type "170@ALEX" -Keys "310@39x60","340@40x40"
+# skip the intro at the title screen, sign in as ALEX, pick the Voyager game,
+# and take the sub for a swim
+scripts\shot.ps1 -At 205,250 -Out work\play.png `
+    -Clicks "100@270,331","118@262,290","150@136,290","170@300,229","195@320,200" `
+    -Type "128@ALEX" -Keys "215@39x50","240@40x40"
 ```
+
+The intro takes about a minute and a half to reach the title screen, because the
+narration plays at its own speed. The title screen's **Start** button skips the
+rest.
 
 Other useful commands:
 

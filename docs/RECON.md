@@ -167,6 +167,10 @@ Things that were not visible from the binary alone, in the order they surfaced:
 - **The game draws into the WinG buffer two ways at once** -- sprites through
   the raw pointer, every string through real GDI into the WinG DC. Handing back
   a plain buffer renders the whole game except its text.
+- **The narration loop never pumps messages.** It writes a buffer with
+  `waveOutWrite` and then spins on `WHDR_DONE` in its own WAVEHDR, so anything
+  that updates that flag on the message pump never runs and the intro stops dead
+  on the first letter of "RED ALERT". The driver has to tell us directly.
 - **It reads just outside the framebuffer.** The save-under behind a popup
   flush against the top-left corner starts two bytes and one row before the
   buffer. Harmless in 1996 when the DIB had neighbours; an access violation

@@ -16,11 +16,17 @@
  * sees.
  *
  * The awkward part is that the driver writes back. It sets WHDR_DONE on the
- * host's WAVEHDR, and the game polls its own copy. Two things keep them in
- * step: every buffer is re-synced whenever the game pumps its message queue
- * (wave_sync_headers, called from the PeekMessageA bridge), and MM_WOM_DONE's
- * lParam is turned back into the game's own header address before the lifted
- * window procedure sees it (wave_lparam_to_game).
+ * host's WAVEHDR, and the game polls its own copy.
+ *
+ * Re-syncing the two whenever the game pumped its message queue looked like
+ * enough and was not: the narration in the opening is played by a loop that
+ * spins on WHDR_DONE and never calls PeekMessage at all, so the intro stopped
+ * dead on the first letter of "RED ALERT" and stayed there.
+ *
+ * So the driver tells us instead. Whatever the game asks for, the device is
+ * opened with CALLBACK_FUNCTION pointing at wave_proc, which writes the flags
+ * straight into the game's own WAVEHDR the moment a buffer finishes -- and then
+ * posts the window message the game was expecting, if it asked for one.
  */
 
 #ifdef _WIN32
@@ -113,14 +119,6 @@ static void wh_pull(int i) {
     MEM32(va + WH_RECORDED) = (u32)g_wh[i].h.dwBytesRecorded;
 }
 
-/* Called from the PeekMessageA bridge: whatever the driver has finished since
- * the last pump becomes visible to code that polls WHDR_DONE. */
-void wave_sync_headers(void) {
-    int i;
-    for (i = 0; i < MAX_WAVEHDRS; i++)
-        if (g_wh[i].used) wh_pull(i);
-}
-
 /* MM_WOM_DONE hands the window the host's WAVEHDR; the game only knows its
  * own. */
 u32 wave_lparam_to_game(uintptr_t lparam) {
@@ -128,6 +126,29 @@ u32 wave_lparam_to_game(uintptr_t lparam) {
     for (i = 0; i < MAX_WAVEHDRS; i++)
         if (g_wh[i].used && (uintptr_t)&g_wh[i].h == lparam) return g_wh[i].va;
     return (u32)lparam;
+}
+
+/* What the game asked to be told on, if it asked for a window. */
+static HWND g_wave_hwnd;
+
+/*
+ * Runs on a driver thread. Only a handful of calls are legal in here -- a few
+ * stores and PostMessage are both on the list.
+ */
+static void CALLBACK wave_proc(HWAVEOUT hwo, UINT msg, DWORD_PTR inst,
+                               DWORD_PTR p1, DWORD_PTR p2) {
+    int i;
+    (void)inst; (void)p2;
+    if (msg != WOM_DONE) return;
+    for (i = 0; i < MAX_WAVEHDRS; i++) {
+        if (g_wh[i].used && (uintptr_t)&g_wh[i].h == (uintptr_t)p1) {
+            wh_pull(i);          /* the flags the spin loop is waiting on */
+            if (g_wave_hwnd)
+                PostMessageA(g_wave_hwnd, 0x3BD /* MM_WOM_DONE */,
+                             (WPARAM)(uintptr_t)hwo, (LPARAM)g_wh[i].va);
+            return;
+        }
+    }
 }
 
 void bridge_waveOutOpen(void) {
