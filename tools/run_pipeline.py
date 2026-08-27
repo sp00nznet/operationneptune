@@ -98,9 +98,11 @@ def generate_recomp_files(functions, iat_map, output_dir, split_size=1000, func_
     for stale in _glob.glob(os.path.join(output_dir, 'recomp_[0-9]*.c')):
         os.remove(stale)
 
+    # lift32 emits a call to a named function as recomp_<name>, so the
+    # definition has to carry the same prefix or the two never meet.
     for addr, nm in (func_names or {}).items():
         if addr in functions:
-            functions[addr].name = nm
+            functions[addr].name = f"recomp_{nm}"
     lifter = Lifter(iat_map=iat_map, func_names=func_names or {},
                     lifted=set(functions.keys()),
                     # cmp/sbb/neg is how MGL returns success; the stale-_cf
@@ -239,9 +241,9 @@ def main():
                 for va, v in json.load(f).items():
                     name = v['name'] if isinstance(v, dict) else v
                     mod = v.get('module') if isinstance(v, dict) else None
-                    # Keep the address in the symbol: two modules can hold a
-                    # function of the same name, and a name that collides is
-                    # worse than one that is merely ugly.
+                    # Module-qualified: two modules can hold a function of the
+                    # same name, and a symbol that collides is worse than one
+                    # that is merely ugly.
                     func_names[int(va, 16)] = f"{mod}_{name}" if mod else name
             print(f"[*] {len(func_names)} functions will be named from {args.names}")
 
