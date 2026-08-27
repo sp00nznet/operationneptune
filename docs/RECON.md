@@ -161,3 +161,13 @@ Things that were not visible from the binary alone, in the order they surfaced:
 - **The game quits over two environment checks** that no modern machine can
   pass: a Windows 3.1 MIDI mapper config file, and a 640x480 256-colour desktop.
   Both are its own INI switches.
+- **Music and CD audio go through MCI, not the MIDI API.** `midiOutGetDevCapsA`
+  is the only MIDI import there is; the score in `SOUNDS\*.MID` is opened as an
+  MCI element and played.
+- **The game draws into the WinG buffer two ways at once** -- sprites through
+  the raw pointer, every string through real GDI into the WinG DC. Handing back
+  a plain buffer renders the whole game except its text.
+- **It reads just outside the framebuffer.** The save-under behind a popup
+  flush against the top-left corner starts two bytes and one row before the
+  buffer. Harmless in 1996 when the DIB had neighbours; an access violation
+  against a mapping of exactly the right size.

@@ -1,0 +1,292 @@
+/*
+ * Audio bridges.
+ *
+ * Two paths, and the game uses both:
+ *
+ *   waveOut*         digital speech and effects, straight out of the NE sound
+ *                    DLLs it reads by hand.
+ *   mciSendCommandA  everything else. There is no midiOutOpen anywhere in the
+ *                    import table -- the MIDI in SOUNDS\*.MID and the CD audio
+ *                    are both driven through MCI.
+ *
+ * Neither can be passed through untouched, because every structure involved
+ * grew when Windows went 64-bit. WAVEHDR is 32 bytes in the game and 48 here;
+ * the MCI parameter blocks all lead with a DWORD_PTR callback. So each one is
+ * copied field by field into a host-side twin, and the twin is what the driver
+ * sees.
+ *
+ * The awkward part is that the driver writes back. It sets WHDR_DONE on the
+ * host's WAVEHDR, and the game polls its own copy. Two things keep them in
+ * step: every buffer is re-synced whenever the game pumps its message queue
+ * (wave_sync_headers, called from the PeekMessageA bridge), and MM_WOM_DONE's
+ * lParam is turned back into the game's own header address before the lifted
+ * window procedure sees it (wave_lparam_to_game).
+ */
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#endif
+
+#define RECOMP_GENERATED_CODE
+#include "recomp_runtime.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Presence turns the log off; an explicit "0" turns it back on. */
+static int audio_quiet(void) {
+    static int q = -1;
+    if (q < 0) {
+        char buf[8];
+        DWORD n = GetEnvironmentVariableA("NEP_QUIET_AUDIO", buf, sizeof(buf));
+        q = n ? !(buf[0] == '0' && buf[1] == 0) : 0;
+    }
+    return q;
+}
+#define ALOG if (!audio_quiet()) fprintf
+
+/* ===================================================================
+ * WAVEHDR: 32 bytes in the game, 48 here
+ * =================================================================== */
+
+/* Field offsets in the game's WAVEHDR. */
+#define WH_LPDATA      0x00
+#define WH_BUFLEN      0x04
+#define WH_RECORDED    0x08
+#define WH_USER        0x0C
+#define WH_FLAGS       0x10
+#define WH_LOOPS       0x14
+#define WH_NEXT        0x18
+#define WH_RESERVED    0x1C
+
+#define MAX_WAVEHDRS 32
+
+static struct {
+    u32     va;        /* the game's WAVEHDR                    */
+    WAVEHDR h;         /* the one the driver sees               */
+    int     used;
+} g_wh[MAX_WAVEHDRS];
+
+static int wh_find(u32 va) {
+    int i;
+    for (i = 0; i < MAX_WAVEHDRS; i++)
+        if (g_wh[i].used && g_wh[i].va == va) return i;
+    return -1;
+}
+
+static int wh_claim(u32 va) {
+    int i = wh_find(va);
+    if (i >= 0) return i;
+    for (i = 0; i < MAX_WAVEHDRS; i++) {
+        if (!g_wh[i].used) {
+            memset(&g_wh[i], 0, sizeof(g_wh[i]));
+            g_wh[i].used = 1;
+            g_wh[i].va = va;
+            return i;
+        }
+    }
+    fprintf(stderr, "    waveOut: header table full\n");
+    return -1;
+}
+
+/* game -> host. lpData is a VA, and the image is mapped 1:1, so it is already
+ * a valid host pointer. */
+static void wh_push(int i) {
+    u32 va = g_wh[i].va;
+    g_wh[i].h.lpData          = (LPSTR)(uintptr_t)ADDR(MEM32(va + WH_LPDATA));
+    g_wh[i].h.dwBufferLength  = MEM32(va + WH_BUFLEN);
+    g_wh[i].h.dwBytesRecorded = MEM32(va + WH_RECORDED);
+    g_wh[i].h.dwUser          = MEM32(va + WH_USER);
+    g_wh[i].h.dwFlags         = MEM32(va + WH_FLAGS);
+    g_wh[i].h.dwLoops         = MEM32(va + WH_LOOPS);
+    g_wh[i].h.lpNext          = NULL;   /* only used for loops we do not chain */
+    g_wh[i].h.reserved        = 0;
+}
+
+/* host -> game: only what the driver is allowed to change. */
+static void wh_pull(int i) {
+    u32 va = g_wh[i].va;
+    MEM32(va + WH_FLAGS)    = (u32)g_wh[i].h.dwFlags;
+    MEM32(va + WH_RECORDED) = (u32)g_wh[i].h.dwBytesRecorded;
+}
+
+/* Called from the PeekMessageA bridge: whatever the driver has finished since
+ * the last pump becomes visible to code that polls WHDR_DONE. */
+void wave_sync_headers(void) {
+    int i;
+    for (i = 0; i < MAX_WAVEHDRS; i++)
+        if (g_wh[i].used) wh_pull(i);
+}
+
+/* MM_WOM_DONE hands the window the host's WAVEHDR; the game only knows its
+ * own. */
+u32 wave_lparam_to_game(uintptr_t lparam) {
+    int i;
+    for (i = 0; i < MAX_WAVEHDRS; i++)
+        if (g_wh[i].used && (uintptr_t)&g_wh[i].h == lparam) return g_wh[i].va;
+    return (u32)lparam;
+}
+
+void bridge_waveOutOpen(void) {
+    HWAVEOUT hwo = NULL;
+    u32 phwo = ARG(1), fmt = ARG(3), cb = ARG(4), inst = ARG(5), flags = ARG(6);
+    MMRESULT r;
+
+    /*
+     * CALLBACK_FUNCTION would be a VA with no machine code behind it. The game
+     * asks for CALLBACK_WINDOW, which needs no thunk -- but say so rather than
+     * hand mmsystem an address it will call.
+     */
+    if ((flags & CALLBACK_TYPEMASK) == CALLBACK_FUNCTION) {
+        fprintf(stderr, "    waveOutOpen: CALLBACK_FUNCTION 0x%X dropped\n", cb);
+        flags = (flags & ~CALLBACK_TYPEMASK) | CALLBACK_NULL;
+        cb = 0;
+    }
+
+    r = waveOutOpen(&hwo, (UINT)ARG(2),
+                    (LPCWAVEFORMATEX)(uintptr_t)ADDR(fmt),
+                    (DWORD_PTR)cb, (DWORD_PTR)inst, flags);
+    if (r == MMSYSERR_NOERROR && phwo) MEM32(phwo) = (u32)(uintptr_t)hwo;
+
+    ALOG(stderr, "    waveOutOpen(fmt=%uHz %ubit %uch) -> %u\n",
+         (unsigned)MEM32(fmt + 4), (unsigned)MEM16(fmt + 14),
+         (unsigned)MEM16(fmt + 2), r);
+    eax = r;
+    esp += 4 + 24;
+}
+
+void bridge_waveOutPrepareHeader(void) {
+    int i = wh_claim(ARG(2));
+    if (i < 0) { eax = MMSYSERR_NOMEM; esp += 4 + 12; return; }
+    wh_push(i);
+    eax = waveOutPrepareHeader((HWAVEOUT)(uintptr_t)ARG(1), &g_wh[i].h, sizeof(WAVEHDR));
+    wh_pull(i);
+    esp += 4 + 12;
+}
+
+void bridge_waveOutWrite(void) {
+    int i = wh_claim(ARG(2));
+    if (i < 0) { eax = MMSYSERR_NOMEM; esp += 4 + 12; return; }
+    /* Re-read: the game fills in lpData and the length between preparing the
+     * header and writing it, and reuses one header for many sounds. */
+    g_wh[i].h.lpData         = (LPSTR)(uintptr_t)ADDR(MEM32(g_wh[i].va + WH_LPDATA));
+    g_wh[i].h.dwBufferLength = MEM32(g_wh[i].va + WH_BUFLEN);
+    g_wh[i].h.dwLoops        = MEM32(g_wh[i].va + WH_LOOPS);
+    eax = waveOutWrite((HWAVEOUT)(uintptr_t)ARG(1), &g_wh[i].h, sizeof(WAVEHDR));
+    wh_pull(i);
+    ALOG(stderr, "    waveOutWrite(%u bytes) -> %u\n", g_wh[i].h.dwBufferLength, eax);
+    esp += 4 + 12;
+}
+
+void bridge_waveOutUnprepareHeader(void) {
+    int i = wh_find(ARG(2));
+    if (i < 0) { eax = MMSYSERR_NOERROR; esp += 4 + 12; return; }
+    eax = waveOutUnprepareHeader((HWAVEOUT)(uintptr_t)ARG(1), &g_wh[i].h, sizeof(WAVEHDR));
+    wh_pull(i);
+    if (eax == MMSYSERR_NOERROR) g_wh[i].used = 0;
+    esp += 4 + 12;
+}
+
+/* ===================================================================
+ * MCI: the music and the CD
+ *
+ * Every parameter block starts with a DWORD_PTR callback, which is 4 bytes in
+ * the game and 8 here, so nothing after it lines up. Each command gets its
+ * fields copied across explicitly.
+ * =================================================================== */
+
+static const char *mci_name(u32 cmd) {
+    switch (cmd) {
+    case MCI_OPEN:   return "OPEN";
+    case MCI_CLOSE:  return "CLOSE";
+    case MCI_PLAY:   return "PLAY";
+    case MCI_STOP:   return "STOP";
+    case MCI_PAUSE:  return "PAUSE";
+    case MCI_RESUME: return "RESUME";
+    case MCI_SEEK:   return "SEEK";
+    case MCI_STATUS: return "STATUS";
+    case MCI_SET:    return "SET";
+    case MCI_INFO:   return "INFO";
+    case MCI_LOAD:   return "LOAD";
+    case MCI_SAVE:   return "SAVE";
+    default:         return "?";
+    }
+}
+
+void bridge_mciSendCommandA(void) {
+    u32 dev = ARG(1), cmd = ARG(2), fl = ARG(3), pva = ARG(4);
+    MCIERROR r = MCIERR_UNSUPPORTED_FUNCTION;
+
+    switch (cmd) {
+    case MCI_OPEN: {
+        /* game: dwCallback, wDeviceID, lpstrDeviceType, lpstrElementName, lpstrAlias */
+        MCI_OPEN_PARMSA p;
+        memset(&p, 0, sizeof(p));
+        p.lpstrDeviceType  = MEM32(pva +  8) ? (LPCSTR)(uintptr_t)ADDR(MEM32(pva +  8)) : NULL;
+        p.lpstrElementName = MEM32(pva + 12) ? (LPCSTR)(uintptr_t)ADDR(MEM32(pva + 12)) : NULL;
+        p.lpstrAlias       = MEM32(pva + 16) ? (LPCSTR)(uintptr_t)ADDR(MEM32(pva + 16)) : NULL;
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        MEM32(pva + 4) = p.wDeviceID;
+        /* Only the fields the flags actually select hold anything. */
+        ALOG(stderr, "    MCI OPEN type='%s' element='%s' -> %lu (id=%u)\n",
+             (fl & MCI_OPEN_TYPE) && p.lpstrDeviceType ? p.lpstrDeviceType : "-",
+             (fl & MCI_OPEN_ELEMENT) && p.lpstrElementName ? p.lpstrElementName : "-",
+             r, p.wDeviceID);
+        break;
+    }
+    case MCI_PLAY: {
+        MCI_PLAY_PARMS p;
+        memset(&p, 0, sizeof(p));
+        p.dwFrom = MEM32(pva + 4);
+        p.dwTo   = MEM32(pva + 8);
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        ALOG(stderr, "    MCI PLAY dev=%u from=%d to=%d -> %lu\n", dev,
+             (fl & MCI_FROM) ? (int)p.dwFrom : -1,
+             (fl & MCI_TO)   ? (int)p.dwTo   : -1, r);
+        break;
+    }
+    case MCI_SEEK: {
+        MCI_SEEK_PARMS p;
+        memset(&p, 0, sizeof(p));
+        p.dwTo = MEM32(pva + 4);
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        break;
+    }
+    case MCI_STATUS: {
+        MCI_STATUS_PARMS p;
+        memset(&p, 0, sizeof(p));
+        p.dwItem  = MEM32(pva + 8);
+        p.dwTrack = MEM32(pva + 12);
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        MEM32(pva + 4) = (u32)p.dwReturn;
+        break;
+    }
+    case MCI_SET: {
+        MCI_SET_PARMS p;
+        memset(&p, 0, sizeof(p));
+        p.dwTimeFormat = MEM32(pva + 4);
+        p.dwAudio      = MEM32(pva + 8);
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        break;
+    }
+    case MCI_CLOSE:
+    case MCI_STOP:
+    case MCI_PAUSE:
+    case MCI_RESUME: {
+        MCI_GENERIC_PARMS p;
+        memset(&p, 0, sizeof(p));
+        r = mciSendCommandA(dev, cmd, fl, (DWORD_PTR)&p);
+        ALOG(stderr, "    MCI %s dev=%u -> %lu\n", mci_name(cmd), dev, r);
+        break;
+    }
+    default:
+        fprintf(stderr, "    MCI %s (0x%X) not translated\n", mci_name(cmd), cmd);
+        break;
+    }
+
+    eax = r;
+    esp += 4 + 16;
+}

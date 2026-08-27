@@ -38,6 +38,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Audio lives in audio.c: every structure involved -- WAVEHDR and all the MCI
+ * parameter blocks -- grew when Windows went 64-bit, so each is copied field
+ * by field into a host-side twin there. */
+void bridge_waveOutOpen(void);
+void bridge_waveOutPrepareHeader(void);
+void bridge_waveOutUnprepareHeader(void);
+void bridge_waveOutWrite(void);
+void bridge_mciSendCommandA(void);
+void wave_sync_headers(void);
+u32  wave_lparam_to_game(uintptr_t lparam);
+
+/*
+ * NEP_QUIET_* switches. Presence turns a log off, and an explicit "0" turns it
+ * back on -- so a driving script can default to quiet and still be overridden
+ * from the outside when something needs chasing.
+ */
+static int nep_quiet(const char *name) {
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    if (!n) return 0;
+    return !(buf[0] == '0' && buf[1] == 0);
+}
+
 #define BRIDGE_BASE 0xB0000000u
 #define MAX_BRIDGES 512
 
@@ -234,7 +257,6 @@ static const struct { const char *dll, *name; int argc; } g_passthrough[] = {
     {"user32", "GetDesktopWindow",         0},
     {"user32", "GetMenu",                  1},
     {"user32", "GetSysColor",              1},
-    {"user32", "GetSystemMetrics",         1},
     {"user32", "GetWindowRect",            2},
     {"user32", "IntersectRect",            3},
     {"user32", "InvalidateRect",           3},
@@ -329,7 +351,7 @@ static void bridge_VirtualFree(void) { nep_heap_free(ARG(1)); eax = 1; esp += 4 
 static int g_file_trace = -1;
 static int file_trace(void) {
     if (g_file_trace < 0)
-        g_file_trace = GetEnvironmentVariableA("NEP_QUIET_FILES", NULL, 0) ? 0 : 1;
+        g_file_trace = nep_quiet("NEP_QUIET_FILES") ? 0 : 1;
     return g_file_trace;
 }
 static void report_file(const char *api, const char *path, int ok) {
@@ -345,12 +367,32 @@ static void bridge_lopen(void) {
     esp += 4 + 8;
 }
 
+/*
+ * SECURITY_ATTRIBUTES is twelve bytes in the game and twenty-four here, so
+ * handing the pointer straight over makes the kernel read a security descriptor
+ * out of the middle of the struct. That is ERROR_NOACCESS (998) on a file that
+ * exists and is perfectly readable -- which is how this surfaced.
+ */
+static SECURITY_ATTRIBUTES *sec_attrs(u32 va, SECURITY_ATTRIBUTES *sa) {
+    if (!va) return NULL;
+    sa->nLength              = sizeof(*sa);
+    sa->lpSecurityDescriptor = MEM32(va + 4) ? (void *)(uintptr_t)ADDR(MEM32(va + 4)) : NULL;
+    sa->bInheritHandle       = (BOOL)MEM32(va + 8);
+    return sa;
+}
+
 static void bridge_CreateFileA(void) {
     const char *path = (const char *)(uintptr_t)ADDR(ARG(1));
+    SECURITY_ATTRIBUTES sa;
     HANDLE h = CreateFileA(path, ARG(2), ARG(3),
-                           ARG(4) ? (LPSECURITY_ATTRIBUTES)(uintptr_t)ADDR(ARG(4)) : NULL,
+                           sec_attrs(ARG(4), &sa),
                            ARG(5), ARG(6), (HANDLE)(uintptr_t)ARG(7));
-    report_file("CreateFileA", path, h != INVALID_HANDLE_VALUE);
+    if (h == INVALID_HANDLE_VALUE && file_trace())
+        fprintf(stderr, "  FILE: CreateFileA          %s   <-- FAILED %lu "
+                        "(access=0x%X share=0x%X disp=%u attr=0x%X)\n",
+                path, GetLastError(), ARG(2), ARG(3), ARG(5), ARG(6));
+    else
+        report_file("CreateFileA", path, 1);
     eax = (u32)(uintptr_t)h;
     esp += 4 + 28;
 }
@@ -447,6 +489,30 @@ static void bridge_GetModuleFileNameA(void) {
     esp += 4 + 12;
 }
 
+/*
+ * The game sizes its window from the screen metrics and then centres a 640x400
+ * picture inside it, so on a modern desktop it opens 1920x1080 with the game in
+ * the middle of a lot of black. Telling it the screen is the size it was
+ * designed for gets a window that fits. NEP_SCREEN=w,h overrides it; 0,0 passes
+ * the real desktop through.
+ */
+static void bridge_GetSystemMetrics(void) {
+    static int cx = -1, cy;
+    if (cx < 0) {
+        char buf[32];
+        cx = 640; cy = 480;
+        if (GetEnvironmentVariableA("NEP_SCREEN", buf, sizeof(buf))) {
+            char *comma = strchr(buf, ',');
+            cx = atoi(buf);
+            cy = comma ? atoi(comma + 1) : 0;
+        }
+    }
+    if (cx > 0 && ARG(1) == SM_CXSCREEN)      eax = (u32)cx;
+    else if (cx > 0 && ARG(1) == SM_CYSCREEN) eax = (u32)cy;
+    else                                      eax = (u32)GetSystemMetrics((int)ARG(1));
+    esp += 4 + 4;
+}
+
 /* ===================================================================
  * Process and CRT startup
  * =================================================================== */
@@ -522,19 +588,54 @@ static void bridge_SetConsoleCtrlHandler(void)      { eax = 1; esp += 4 + 8; }
  * writes the pixels itself, and all we have to do is put them on screen.
  * =================================================================== */
 
-static u32   g_wing_bits;        /* low-VA framebuffer the game draws into */
+static u32   g_wing_bits;        /* the framebuffer, at a 32-bit address */
+static u32   g_wing_top;         /* the TOPMOST scanline -- what WinG hands back */
 static int   g_wing_w, g_wing_h;
 static HDC   g_wing_dc;
+static HBITMAP g_wing_bmp;
 static u32   g_wing_pal[256];
-static BITMAPINFO *g_wing_bmi;   /* header + 256 palette entries */
 
-static void wing_ensure_bmi(void) {
-    if (g_wing_bmi) return;
-    g_wing_bmi = (BITMAPINFO *)calloc(1, sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD));
-    g_wing_bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    g_wing_bmi->bmiHeader.biPlanes = 1;
-    g_wing_bmi->bmiHeader.biBitCount = 8;
-    g_wing_bmi->bmiHeader.biCompression = BI_RGB;
+/*
+ * The framebuffer has to be readable two ways at once.
+ *
+ * The game asks WinG for a raw pointer and writes most of its pixels through it
+ * directly, so that pointer must be 32 bits. But it also selects the WinG bitmap
+ * into the WinG DC and draws text with real GDI -- CreateFontIndirectA, TextOutA,
+ * SetTextColor -- so GDI has to be writing into the same pixels. Handing back a
+ * plain buffer got the sprites and lost every string: the text went to the 1x1
+ * default bitmap of a memory DC with nothing selected.
+ *
+ * So the pixels live in a pagefile-backed section, mapped twice: once by us at a
+ * fixed low address for the game, and once by CreateDIBSection for GDI. Two
+ * views, same pages.
+ */
+#define WING_VA_BASE 0x30000000u
+
+/*
+ * ponytail: a page of slack either side of the picture, because the game reads
+ * just outside it.
+ *
+ * Its save-under routine (sub_00412F6B) copies the rectangle behind a popup by
+ * walking `framebuffer + x + y*640`, and for a popup flush against the top-left
+ * corner that starts two bytes and one row before the buffer. In 1996 the DIB
+ * had neighbours and the read returned junk nobody looked at. Against a mapping
+ * of exactly the right size it is an access violation.
+ *
+ * 64 KB covers a hundred rows in either direction. If something ever reads
+ * further out than that, the fix is to find out why -- not to widen this.
+ */
+#define WING_SLACK   0x10000u
+
+static HANDLE g_wing_section;
+
+static void wing_free(void) {
+    /* Unselect before deleting: DeleteObject on a bitmap still selected into a
+     * DC fails, and unmapping the section under a live DIB section is how GDI
+     * ends up writing to nothing. */
+    if (g_wing_dc && g_wing_bmp) SelectObject(g_wing_dc, GetStockObject(DEFAULT_GUI_FONT));
+    if (g_wing_bmp) { DeleteObject(g_wing_bmp); g_wing_bmp = NULL; }
+    if (g_wing_bits) { UnmapViewOfFile((void *)(uintptr_t)WING_VA_BASE); g_wing_bits = 0; }
+    if (g_wing_section) { CloseHandle(g_wing_section); g_wing_section = NULL; }
 }
 
 /* WinGCreateDC(void) -> HDC */
@@ -558,34 +659,96 @@ static void bridge_WinGRecommendDIBFormat(void) {
     esp += 4 + 4;
 }
 
-/* WinGCreateBitmap(HDC, BITMAPINFO*, void**) -> HBITMAP
- * The third argument is where WinG writes the pixel pointer. It has to be a
- * 32-bit address the game can dereference, so the framebuffer comes out of the
- * low heap rather than from CreateDIBSection. */
+/* WinGCreateBitmap(HDC, BITMAPINFO*, void**) -> HBITMAP */
 static void bridge_WinGCreateBitmap(void) {
     u32 bmi = ARG(2), ppbits = ARG(3);
     int w = (int)MEM32(bmi + 4);
-    int h = (int)MEM32(bmi + 8);
-    if (h < 0) h = -h;
-    if (w <= 0 || h <= 0) { w = 640; h = 480; }
+    int raw_h = (int)MEM32(bmi + 8);
+    int h = raw_h < 0 ? -raw_h : raw_h;
+    int stride;
+    DWORD span;
+    void *gdi_bits = NULL, *our_view;
+    char info[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
+    BITMAPINFO *bi = (BITMAPINFO *)info;
 
-    if (g_wing_bits) nep_heap_free(g_wing_bits);
-    g_wing_w = w; g_wing_h = h;
-    g_wing_bits = nep_heap_alloc((u32)(((w + 3) & ~3) * h));
-    if (ppbits) MEM32(ppbits) = g_wing_bits;
+    if (w <= 0 || h <= 0) { w = 640; h = 480; raw_h = -480; }
+    wing_free();
 
-    fprintf(stderr, "    WinG: %dx%d framebuffer at 0x%08X\n", w, h, g_wing_bits);
-    eax = g_wing_bits;   /* the "HBITMAP" -- only ever handed back to us */
+    g_wing_w = w;
+    g_wing_h = h;
+    stride = (w + 3) & ~3;
+    span = (DWORD)(stride * h);
+
+    g_wing_section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                       span + 2 * WING_SLACK, NULL);
+    our_view = g_wing_section
+             ? MapViewOfFileEx(g_wing_section, FILE_MAP_ALL_ACCESS, 0, 0,
+                               span + 2 * WING_SLACK, (void *)(uintptr_t)WING_VA_BASE)
+             : NULL;
+    if (!our_view) {
+        fprintf(stderr, "    WinG: could not map %u bytes at 0x%08X (%lu)\n",
+                span, WING_VA_BASE, GetLastError());
+        wing_free();
+        eax = 0;
+        esp += 4 + 12;
+        return;
+    }
+    g_wing_bits = WING_VA_BASE + WING_SLACK;
+
+    memset(info, 0, sizeof(info));
+    bi->bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi->bmiHeader.biWidth       = w;
+    bi->bmiHeader.biHeight      = raw_h;       /* whichever way round it asked for */
+    bi->bmiHeader.biPlanes      = 1;
+    bi->bmiHeader.biBitCount    = 8;
+    bi->bmiHeader.biCompression = BI_RGB;
+    bi->bmiHeader.biClrUsed     = 256;
+    memcpy(bi->bmiColors, g_wing_pal, sizeof(g_wing_pal));
+
+    g_wing_bmp = CreateDIBSection(g_wing_dc, bi, DIB_RGB_COLORS, &gdi_bits,
+                                  g_wing_section, WING_SLACK);
+    if (!g_wing_bmp) {
+        fprintf(stderr, "    WinG: CreateDIBSection failed (%lu)\n", GetLastError());
+        wing_free();
+        eax = 0;
+        esp += 4 + 12;
+        return;
+    }
+    /* The game selects it too, but text drawn before that would otherwise be
+     * lost, and selecting twice costs nothing. */
+    if (g_wing_dc) SelectObject(g_wing_dc, g_wing_bmp);
+
+    /*
+     * WinG hands back the TOPMOST scanline, not the start of the buffer. For a
+     * bottom-up DIB those are different ends: row 0 lives at the far end and
+     * the game walks backwards through memory as y increases.
+     *
+     * Getting this wrong is quiet until it is not. The buffer used to come from
+     * our own heap with megabytes below it, so writing above row 0 just
+     * scribbled on the heap; once it moved to a mapping of exactly the right
+     * size, the same write landed one row before the base and faulted.
+     */
+    g_wing_top = raw_h > 0 ? g_wing_bits + (u32)((h - 1) * stride) : g_wing_bits;
+
+    if (ppbits) MEM32(ppbits) = g_wing_top;
+    fprintf(stderr, "    WinG: %dx%d %s framebuffer at 0x%08X, top row 0x%08X (GDI view %p)\n",
+            w, h, raw_h > 0 ? "bottom-up" : "top-down",
+            g_wing_bits, g_wing_top, gdi_bits);
+    eax = (u32)(uintptr_t)g_wing_bmp;
     esp += 4 + 12;
 }
 
-static void bridge_WinGGetDIBPointer(void) { eax = g_wing_bits; esp += 4 + 8; }
+static void bridge_WinGGetDIBPointer(void) { eax = g_wing_top; esp += 4 + 8; }
 
-/* WinGSetDIBColorTable(HDC, UINT start, UINT n, RGBQUAD*) -> UINT */
+/* WinGSetDIBColorTable(HDC, UINT start, UINT n, RGBQUAD*) -> UINT.
+ * GDI needs the table as well as us: it is what TextOutA maps its colours
+ * through when it draws into an 8bpp DIB section. */
 static void bridge_WinGSetDIBColorTable(void) {
     u32 start = ARG(2), n = ARG(3), src = ARG(4), i;
     for (i = 0; i < n && start + i < 256; i++)
         g_wing_pal[start + i] = MEM32(src + i * 4);
+    if (g_wing_dc && g_wing_bmp)
+        SetDIBColorTable(g_wing_dc, start, n, (const RGBQUAD *)&g_wing_pal[start]);
     eax = n;
     esp += 4 + 16;
 }
@@ -598,21 +761,57 @@ static void bridge_WinGGetDIBColorTable(void) {
     esp += 4 + 16;
 }
 
-static void wing_blit(HDC dst, int dx, int dy, int w, int h, int sx, int sy, int sw, int sh) {
-    if (!g_wing_bits || !dst) return;
-    wing_ensure_bmi();
-    g_wing_bmi->bmiHeader.biWidth  = g_wing_w;
-    g_wing_bmi->bmiHeader.biHeight = -g_wing_h;          /* top-down */
-    memcpy(g_wing_bmi->bmiColors, g_wing_pal, sizeof(g_wing_pal));
-    SetStretchBltMode(dst, COLORONCOLOR);
-    StretchDIBits(dst, dx, dy, w, h, sx, sy, sw, sh,
-                  (const void *)(uintptr_t)ADDR(g_wing_bits),
-                  g_wing_bmi, DIB_RGB_COLORS, SRCCOPY);
+static void wing_blit(HDC dst, HDC src, int dx, int dy, int w, int h,
+                      int sx, int sy, int sw, int sh) {
+    static int said, last_w, last_h;
+    if (!dst || !src) return;
+    /* Where the picture lands in the window, once -- everything the game draws
+     * is at this offset, so it is what turns a pixel in a screenshot back into
+     * a coordinate to click. */
+    if (!said || w != last_w || h != last_h) {
+        said = 1; last_w = w; last_h = h;
+        if (!nep_quiet("NEP_QUIET_BRIDGES"))
+            fprintf(stderr, "    WinG: blitting %dx%d to client (%d,%d) from (%d,%d)\n",
+                    w, h, dx, dy, sx, sy);
+        /*
+         * The game sizes its window as if it were on Windows 3.1, where a
+         * 640x480 window on a 640x480 screen had the whole screen inside it.
+         * Windows 11 spends sixteen pixels of that on a border and thirty-nine
+         * on a caption, so the picture loses its right and bottom edges.
+         *
+         * The first blit is the right moment to fix it: it is the first time
+         * anyone knows how big the picture actually is, and the game has
+         * finished moving its window by then.
+         */
+        HWND hw = WindowFromDC(dst);
+        RECT cl, want;
+        if (hw && GetClientRect(hw, &cl) &&
+            (cl.right < dx + w || cl.bottom < dy + h)) {
+            want.left = want.top = 0;
+            want.right  = dx + w;
+            want.bottom = dy + h;
+            if (AdjustWindowRectEx(&want, (DWORD)GetWindowLongPtrA(hw, GWL_STYLE),
+                                   GetMenu(hw) != NULL,
+                                   (DWORD)GetWindowLongPtrA(hw, GWL_EXSTYLE))) {
+                SetWindowPos(hw, NULL, 0, 0, want.right - want.left, want.bottom - want.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                fprintf(stderr, "    WinG: client was %ldx%ld, grown to fit %dx%d\n",
+                        cl.right, cl.bottom, dx + w, dy + h);
+            }
+        }
+    }
+    if (w == sw && h == sh) {
+        BitBlt(dst, dx, dy, w, h, src, sx, sy, SRCCOPY);
+    } else {
+        SetStretchBltMode(dst, COLORONCOLOR);
+        StretchBlt(dst, dx, dy, w, h, src, sx, sy, sw, sh, SRCCOPY);
+    }
 }
 
 /* WinGBitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy) */
 static void bridge_WinGBitBlt(void) {
-    wing_blit((HDC)(uintptr_t)ARG(1), (int)ARG(2), (int)ARG(3), (int)ARG(4), (int)ARG(5),
+    wing_blit((HDC)(uintptr_t)ARG(1), (HDC)(uintptr_t)ARG(6),
+              (int)ARG(2), (int)ARG(3), (int)ARG(4), (int)ARG(5),
               (int)ARG(7), (int)ARG(8), (int)ARG(4), (int)ARG(5));
     eax = 1;
     esp += 4 + 32;
@@ -620,7 +819,8 @@ static void bridge_WinGBitBlt(void) {
 
 /* WinGStretchBlt(HDC dst,int x,int y,int w,int h, HDC src,int sx,int sy,int sw,int sh) */
 static void bridge_WinGStretchBlt(void) {
-    wing_blit((HDC)(uintptr_t)ARG(1), (int)ARG(2), (int)ARG(3), (int)ARG(4), (int)ARG(5),
+    wing_blit((HDC)(uintptr_t)ARG(1), (HDC)(uintptr_t)ARG(6),
+              (int)ARG(2), (int)ARG(3), (int)ARG(4), (int)ARG(5),
               (int)ARG(7), (int)ARG(8), (int)ARG(9), (int)ARG(10));
     eax = 1;
     esp += 4 + 40;
@@ -808,6 +1008,10 @@ static LRESULT CALLBACK nep_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         fprintf(stderr, "    wndproc 0x%08X was not lifted\n", g_lifted_wndproc);
         return DefWindowProcA(h, m, w, l);
     }
+    /* MM_WOM_DONE (0x3BD) hands back the WAVEHDR the driver finished with,
+     * which is the host-side twin -- see audio.c. */
+    if (m == 0x3BD) l = (LPARAM)wave_lparam_to_game((uintptr_t)l);
+
     /* stdcall, right to left: the callee pops all four. */
     PUSH32(esp, (u32)l);
     PUSH32(esp, (u32)w);
@@ -852,12 +1056,14 @@ static void bridge_CreateWindowExA(void) {
                              (int)ARG(5), (int)ARG(6), (int)ARG(7), (int)ARG(8),
                              (HWND)(uintptr_t)ARG(9), (HMENU)(uintptr_t)ARG(10),
                              (HINSTANCE)(uintptr_t)ARG(11), (void *)(uintptr_t)ARG(12));
-    if (!h)
+    if (!h) {
         fprintf(stderr, "    CreateWindowExA('%s', style=0x%X, %dx%d at %d,%d, hInst=0x%X) FAILED (%lu)\n",
                 cls, ARG(4), (int)ARG(7), (int)ARG(8), (int)ARG(5), (int)ARG(6),
                 ARG(11), GetLastError());
-    else
-        fprintf(stderr, "    CreateWindowExA('%s') -> 0x%08X\n", cls, (u32)(uintptr_t)h);
+    } else {
+        fprintf(stderr, "    CreateWindowExA('%s', style=0x%X) -> 0x%08X, client %dx%d\n",
+                cls, ARG(4), (u32)(uintptr_t)h, (int)ARG(7), (int)ARG(8));
+    }
     eax = (u32)(uintptr_t)h;
     esp += 4 + 48;
 }
@@ -886,6 +1092,7 @@ static void msg_from_game(u32 p, MSG *m) {
 
 static void bridge_PeekMessageA(void) {
     MSG m;
+    wave_sync_headers();
     eax = PeekMessageA(&m, (HWND)(uintptr_t)ARG(2), ARG(3), ARG(4), ARG(5));
     if (eax) msg_to_game(&m, ARG(1));
     esp += 4 + 20;
@@ -934,13 +1141,6 @@ static void bridge_EndPaint(void) {
 static void bridge_DialogBoxParamA(void)   { fprintf(stderr, "    DialogBoxParamA: unimplemented\n"); eax = (u32)-1; esp += 4 + 20; }
 static void bridge_EnumThreadWindows(void) { fprintf(stderr, "    EnumThreadWindows: unimplemented\n"); eax = 0; esp += 4 + 12; }
 
-/* Audio: the WAVEHDR the game hands us is 32 bytes, not the host's 48, so these
- * need translating before they can be passed through. Silent until then. */
-static void bridge_waveOutOpen(void)             { fprintf(stderr, "    waveOutOpen: silent (unimplemented)\n"); eax = MMSYSERR_NODRIVER; esp += 4 + 24; }
-static void bridge_waveOutPrepareHeader(void)    { eax = MMSYSERR_NODRIVER; esp += 4 + 12; }
-static void bridge_waveOutUnprepareHeader(void)  { eax = MMSYSERR_NODRIVER; esp += 4 + 12; }
-static void bridge_waveOutWrite(void)            { eax = MMSYSERR_NODRIVER; esp += 4 + 12; }
-static void bridge_mciSendCommandA(void)         { eax = 1; esp += 4 + 16; }
 
 /* ===================================================================
  * Wiring
@@ -950,7 +1150,7 @@ void setup_iat_bridges(void) {
     HMODULE h;
     size_t i;
 
-    if (GetEnvironmentVariableA("NEP_QUIET_BRIDGES", NULL, 0)) g_verbose = 0;
+    if (nep_quiet("NEP_QUIET_BRIDGES")) g_verbose = 0;
 
     for (i = 0; i < sizeof(g_passthrough) / sizeof(g_passthrough[0]); i++) {
         void *real;
@@ -974,6 +1174,7 @@ void setup_iat_bridges(void) {
     bind("VirtualAlloc",             bridge_VirtualAlloc,             NULL, 4);
     bind("VirtualFree",              bridge_VirtualFree,              NULL, 3);
 
+    bind("GetSystemMetrics",         bridge_GetSystemMetrics,         NULL, 1);
     bind("_lopen",                   bridge_lopen,                    NULL, 2);
     bind("GetModuleFileNameA",       bridge_GetModuleFileNameA,       NULL, 3);
     bind("FindFirstFileA",           bridge_FindFirstFileA,           NULL, 2);

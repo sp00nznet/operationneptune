@@ -20,19 +20,52 @@ Bolo Adventures III (1993) and El-Fish (1993).
 
 ## Status
 
-**It boots, and it draws.** The recompiled binary runs the Borland CRT startup,
-reaches WinMain, passes the game's own environment checks, opens all six of its
-resource DLLs by hand, and renders its opening sequence.
+**It plays.** The recompiled binary runs the Borland CRT startup, reaches
+WinMain, passes the game's own environment checks, opens all six of its resource
+DLLs by hand, plays the whole opening sequence with music and speech, signs a
+player in, and puts you in the submarine.
 
-![The title screen, drawn by recompiled code](docs/img/title.png)
+![In the submarine, Dragon Reef](docs/img/gameplay.png)
 
-*The title screen. Every pixel drawn by Operation Neptune's own code, running
-natively.*
+*Sector First, Dragon Reef. The sub, the reef, the fish and the oxygen gauge —
+all drawn by Operation Neptune's own code, running natively. The arrow keys move
+the sub.*
 
+![Sign in and choose a level](docs/img/signin.png)
+
+*The sign-in roster and the level chooser. The panel text is real GDI —
+`CreateFontIndirectA` and `TextOutA` into the same pixels the game writes its
+sprites to.*
+
+![The title screen](docs/img/title.png)
 ![The opening dissolve](docs/img/dissolve.png)
 
-*Mid-dissolve in the opening: the world map wiping through the sea. `OPENING`
-and its `_Odissolve` are two of the 96 modules the linker map names.*
+*The title screen, and mid-dissolve in the opening as the world map wipes
+through the sea. `OPENING` and its `_Odissolve` are two of the 96 modules the
+linker map names.*
+
+Working:
+
+- **The intro runs** end to end — the title, the Galaxy capsule story screens,
+  the tracking map — with its MIDI score and its narration.
+- **Sound.** `Enept1.mid` plays through MCI; speech and effects go out through
+  `waveOut` at 8 and 16 kHz.
+- **Input.** Mouse and keyboard reach the game's own window procedure, so the
+  menus click and the sub moves.
+- **The player roster.** New player, name entry, level choice, and the game
+  starts in the right zone at the right difficulty.
+- **Graphics are correct**, sprites and GDI text alike, at 640x400 in 256
+  colours.
+
+Not working yet:
+
+- **Dialogs are stubbed.** `DialogBoxParamA` takes a dialog procedure that lives
+  in lifted code; the window procedure already makes that round trip, so this is
+  the same trick again. Nothing on the path above has needed one.
+- **Nothing is named.** 1,205 functions are still `sub_0041xxxx` while
+  `ONWIN.MAP` sits there with 1,058 names in it. See [Next](#next).
+- **Nobody has finished a mission.** The sub moves and the reef is there; how
+  much of the puzzle machinery works is untested.
 
 The lift itself:
 
@@ -50,17 +83,6 @@ what a small, unpacked, Borland-compiled 32-bit binary with no hand-written
 assembly and no DirectX looks like going through `lift32` — plain integer code,
 x87 for the maths, and a DIB for the pixels.
 
-Not working yet:
-
-- **No sound.** `waveOut*` and `mciSendCommandA` are stubbed. The `WAVEHDR` the
-  game hands over is the 32-bit layout, so those need translating before they
-  can be passed through, the way `MSG` and `WNDCLASSA` already are.
-- **Dialogs are stubbed.** `DialogBoxParamA` takes a dialog procedure that lives
-  in lifted code; the window procedure already makes that round trip, so this is
-  the same trick again.
-- **Nothing is named.** 1,205 functions are still `sub_0041xxxx` while
-  `ONWIN.MAP` sits there with 1,058 names in it. See [Next](#next).
-
 ## What it draws through
 
 There is not one `BitBlt` in the import table. The game loads **WING32.DLL** at
@@ -69,12 +91,18 @@ through eight entry points: it creates a memory DC, asks WinG for a bitmap, gets
 a raw pointer to the pixels, renders into that with its own code, and blits.
 
 Windows has not shipped WinG in decades, so `src/engine/iat_bridge.c` is WinG
-now. That turned out to be the short path to a picture: the game writes every
-pixel itself, and the shim only has to hand it a buffer and put the result on
-screen. The buffer it asks for is 640×**800** for a 640×400 screen — two pages,
+now. The buffer it asks for is 640x**800** for a 640x400 screen — two pages,
 flipped by blitting from a different `y`.
 
-Three other things could not simply be passed through to the host:
+The catch is that the game draws into that buffer **two ways at once**: sprites
+through the raw pointer WinG hands back, and every string through real GDI —
+`CreateFontIndirectA`, `SetTextColor`, `TextOutA` — into the WinG DC. So the
+pixels cannot just be a buffer of ours. They live in a pagefile-backed section
+mapped twice: once by us at a fixed address below 4 GB, for the game, and once
+by `CreateDIBSection`, for GDI. Two views, one set of pages. Handing back a
+plain buffer got every sprite and lost every string.
+
+Four other things could not simply be passed through to the host:
 
 - **Anything returning a pointer.** `GlobalAlloc`, `GlobalLock` and
   `VirtualAlloc` hand the game an address it keeps in a 32-bit slot, and on a
@@ -83,6 +111,11 @@ Three other things could not simply be passed through to the host:
 - **Callbacks and structs.** The window procedure is a VA with no machine code
   behind it, and `WNDCLASSA`, `MSG` and `PAINTSTRUCT` are laid out differently
   for 32- and 64-bit. Those are translated field by field.
+- **Audio, twice over.** `WAVEHDR` is 32 bytes in the game and 48 here, and
+  every MCI parameter block leads with a callback that grew from 4 bytes to 8.
+  Each is copied field by field into a host-side twin in `src/engine/audio.c`.
+  The driver writes back, too — `WHDR_DONE` lands on the host's header while the
+  game polls its own, so the buffers are re-synced on every message pump.
 - **Two checks from 1996.** `CheckSound` opens `C:\WINDOWS\SYSTEM\MIDIMAP.CFG`,
   the Windows 3.1 MIDI mapper config; `CheckDisplay` wants the desktop in
   640×480 at 256 colours. Both are the game's own INI switches, meant to be
@@ -138,6 +171,7 @@ tools/
   parse_map.py       ONWIN.MAP -> work/symbols.json
   extract_assets.py  TLC resource extractor (from OpenGizmos)
 src/engine/     the runtime: register model, low heap, IAT bridges, WinG
+  audio.c            waveOut and MCI, translated for 64-bit
 src/recomp/gen/ generated C (regenerated, not committed)
 scripts/        build.ps1, shot.ps1
 extracted/      extracted assets (regenerated, not committed)
@@ -165,9 +199,23 @@ is seconds.
 | `NEP_QUIET_FILES=1` | stop logging every file and INI read |
 | `NEP_NO_DIALOGS=1` | answer message boxes instead of blocking on them |
 | `NEP_WATCHDOG_MS=10000` | dump a trace and quit after this long |
+| `NEP_QUIET_AUDIO=1` | stop logging waveOut and MCI |
+| `NEP_SCREEN=w,h` | what to tell the game the desktop is (default 640,480) |
 | `NEP_WATCH=0x412a40,…` | report entry to these functions (`build.ps1 -Trace`) |
 
-`scripts\shot.ps1` runs it for a few seconds and photographs the window.
+Any of the `QUIET` switches set to `0` turns that log back on, so a driving
+script can default to quiet and still be overridden from outside.
+
+`scripts\shot.ps1` runs the game, drives it, and photographs it. Shots are of
+the client area, and the picture is blitted to client (0,0), so a pixel in a
+screenshot is a coordinate you can click:
+
+```powershell
+# sign in as ALEX, pick the Voyager game, and take the sub for a swim
+scripts\shot.ps1 -At 300,360 -Out work\play.png `
+    -Clicks 30,45,60,75,90,110,140,"160@262,290","205@136,290","240@300,229" `
+    -Type "170@ALEX" -Keys "310@39x60","340@40x40"
+```
 
 Other useful commands:
 
@@ -186,11 +234,13 @@ python tools/extract_assets.py on original extracted/on --all
    shape and string references — turns 1,058 names into 1,058 named lifted
    functions. This is the highest-value thing left; every trace above would read
    in the game's own vocabulary instead of hex.
-2. **Sound.** Translate `WAVEHDR` and hand `waveOut*` to the host, then the MIDI
-   in `SOUNDS\*.MID` and the CD audio behind `mciSendCommandA`.
+2. **Play a mission through.** The sub moves and the reef is drawn; the maths
+   problems, the foes, the capsule pieces and the salvage are all still
+   unvisited.
 3. **Dialogs.** `DialogBoxParamA` needs the same lifted-callback round trip the
    window procedure already does.
-4. **Play it.** The intro runs; nobody has reached the submarine yet.
+4. **Save games.** `ONUSERS.DAT` and `HALLFAME.DAT` load; nothing has written
+   one back yet.
 
 ## Legal
 

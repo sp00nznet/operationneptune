@@ -17,7 +17,8 @@ $srcs = @(
     "src\engine\recomp_runtime.c",
     "src\engine\image_loader.c",
     "src\engine\premap.c",
-    "src\engine\iat_bridge.c"
+    "src\engine\iat_bridge.c",
+    "src\engine\audio.c"
 )
 $srcs += (Get-ChildItem "src\recomp\gen\recomp_*.c" | ForEach-Object { $_.FullName })
 
