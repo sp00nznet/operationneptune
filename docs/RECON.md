@@ -131,11 +131,33 @@ Worth keeping for the record; not on the recomp path.
 
 ## What this means for the plan
 
-1. Lift `ONWIN32.EXE` with `lift32` — flat, unpacked, four import DLLs.
-2. Answer its 139 Win32 imports with pcrecomp's `runtime/compat` SDL2 layer.
-   GDI32 + USER32 + WINMM only: no DirectDraw, no DirectSound, no OLE. This is
-   a `BitBlt`-and-`waveOut` game.
+1. Lift `ONWIN32.EXE` with `lift32` -- flat, unpacked, four import DLLs. **Done:
+   1,205 functions, 189K lines, no errors.**
+2. Answer its 139 Win32 imports. **Done** -- most of them pass straight through
+   to the real API, because this is a Win32 program running on Win32. The
+   exceptions are in [the README](../README.md#what-it-draws-through).
 3. Name the lifted functions from `ONWIN.MAP` rather than leaving them numbered.
-4. Assets are already understood — the RUND sprite codec, the RLE tilemaps and
+   Not started; the highest-value thing left.
+4. Assets are already understood -- the RUND sprite codec, the RLE tilemaps and
    the palette were cracked in earlier work on this same engine family. See
    [FORMATS](FORMATS.md).
+
+## What the first run taught us
+
+Things that were not visible from the binary alone, in the order they surfaced:
+
+- **All drawing goes through WinG.** There is no `BitBlt` in the import table
+  because `WING32.DLL` is loaded at runtime. The game asks it for a 640x800
+  buffer to drive a 640x400 screen -- two pages, flipped by blitting from a
+  different source `y`.
+- **The 32-bit build reads its own resource DLLs by hand.** `NEP256.DLL` and
+  friends are 16-bit NE modules that no 32-bit process could ever have
+  `LoadLibrary`-ed, which is why this build imports the `_lopen`/`_lread`
+  family. It opens all six with `CreateFileA` and parses them itself.
+- **`NE2SOUND.DLL` is a checksum.** It is twelve bytes long, and `ONWINCD.INI`
+  carries `NE2sound=12`. The game finds the file, compares the size against the
+  INI, and refuses to start if they disagree -- a 1997 anti-piracy check that
+  amounts to "is the CD really mounted".
+- **The game quits over two environment checks** that no modern machine can
+  pass: a Windows 3.1 MIDI mapper config file, and a 640x480 256-colour desktop.
+  Both are its own INI switches.
